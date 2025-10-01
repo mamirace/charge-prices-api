@@ -1,66 +1,108 @@
 from fastapi import FastAPI, Query
+from typing import Optional, List, Dict, Any
 import pandas as pd
+import os, re, unicodedata
 
-app = FastAPI()
+app = FastAPI(title="Charge Prices API")
 
-# Excel dosyasını yükle
-excel_path = "data/Dosya.xlsx"
+EXCEL_PATH = os.path.join("data", "Dosya.xlsx")
 
-# Fiyatları getir
-@app.get("/prices")
-def get_prices(station: str = Query(...), socket_type: str = Query(...)):
-    df = pd.read_excel(excel_path, sheet_name="Sayfa1")
+# --- Yardımcılar -------------------------------------------------------------
 
-    # İstasyon filtreleme
-    results = df[df["İstasyon"].str.contains(station, case=False, na=False)]
+def _read(sheet: str) -> pd.DataFrame:
+    # Excel her istekte tekrar okunur (dosyayı güncellersen anında yansısın diye)
+    return pd.read_excel(EXCEL_PATH, sheet_name=sheet, engine="openpyxl")
 
-    # Soket tipi filtreleme
-    if socket_type:
-        results = results[results["Fiyat Tipi"].str.contains(socket_type, case=False, na=False)]
+_norm_re = re.compile(r"[\s\-.()/_,]+")
+def _norm(s: Any) -> str:
+    """Türkçe duyarlı, boşluk-tire-noktalama ayıklayan normalizasyon."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    s = str(s).casefold()
+    # diakritikleri kaldır (İ/ı vb. için daha toleranslı)
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    s = _norm_re.sub("", s)
+    return s
 
-    data = []
-    for _, row in results.iterrows():
-        data.append({
-            "ChatGPT Kanonik İsim": row["ChatGPT Kanonik İsim"],
-            "İstasyon": row["İstasyon"],
-            "Fiyat Tipi": row["Fiyat Tipi"],
-            "Fiyat": row["Fiyat"]
-        })
-    return {"status": "ok", "data": data}
+def _filter_by_station(df: pd.DataFrame, station: Optional[str]) -> pd.DataFrame:
+    if not station:
+        return df
+    q = _norm(station)
+    # Hem "İstasyon" hem "ChatGPT Kanonik İsim" üzerinde yakın eşleşme
+    mask = df["İstasyon"].apply(_norm).str.contains(q) | df["ChatGPT Kanonik İsim"].apply(_norm).str.contains(q)
+    return df[mask]
 
+def _ok(data: List[Dict]) -> Dict[str, Any]:
+    return {"status": "ok", "count": len(data), "data": data}
 
-# Mobil uygulamaları getir
-@app.get("/apps")
-def get_apps(station: str = Query(...)):
-    df = pd.read_excel(excel_path, sheet_name="Sayfa2")
+def _err(msg: str) -> Dict[str, Any]:
+    return {"status": "error", "message": msg}
 
-    results = df[df["İstasyon"].str.contains(station, case=False, na=False)]
+# --- Endpointler -------------------------------------------------------------
 
-    data = []
-    for _, row in results.iterrows():
-        data.append({
-            "ChatGPT Kanonik İsim": row["ChatGPT Kanonik İsim"],
-            "İstasyon": row["İstasyon"],
-            "Mobil Uygulama": row["Mobil Uygulama"],
-            "Diğer Mobil Uygulamalar": row["Diğer Mobil Uygulamalar"],
-            "Grup/Şirket Bilgisi": row["Grup/Şirket Bilgisi"]
-        })
-    return {"status": "ok", "data": data}
+@app.get("/", tags=["health"])
+def root():
+    return {"message": "Charge Prices API aktif", "endpoints": ["/prices", "/apps", "/campaigns"]}
 
+@app.get("/prices", tags=["prices"])
+def get_prices(
+    station: Optional[str] = Query(None, description="İstasyon adı (örn. ZES, Trugo, Shell Recharge)"),
+    socket_type: Optional[str] = Query(
+        None,
+        description='Şarj tipi: "Yavaş Şarj (AC)" | "Hızlı Şarj (DC)" | "AC Detay" | "DC Detay"',
+    ),
+):
+    try:
+        df = _read("Sayfa1")
+        # Beklenen kolonlar
+        needed = {"ChatGPT Kanonik İsim", "İstasyon", "Fiyat Tipi", "Fiyat"}
+        if not needed.issubset(df.columns):
+            return _err("Sayfa1 kolonları beklenen formatta değil.")
+        # İstasyon filtreleme
+        df = _filter_by_station(df, station)
+        # Tip filtreleme
+        if socket_type:
+            df = df[df["Fiyat Tipi"].astype(str).str.casefold() == socket_type.casefold()]
+        # Çıktı
+        out = df[["ChatGPT Kanonik İsim", "İstasyon", "Fiyat Tipi", "Fiyat"]].to_dict(orient="records")
+        return _ok(out)
+    except Exception as e:
+        return _err(str(e))
 
-# Kampanyaları getir
-@app.get("/campaigns")
-def get_campaigns(station: str = Query(...)):
-    df = pd.read_excel(excel_path, sheet_name="Sayfa3")
+@app.get("/apps", tags=["apps"])
+def get_apps(
+    station: Optional[str] = Query(None, description="İstasyon adı (örn. ZES, Shell Recharge, Trugo)")
+):
+    try:
+        df = _read("Sayfa2")
+        needed = {
+            "ChatGPT Kanonik İsim",
+            "İstasyon",
+            "Mobil Uygulama",
+            "Diğer Mobil Uygulamalar",
+            "Grup/Şirket Bilgisi",
+        }
+        if not needed.issubset(df.columns):
+            return _err("Sayfa2 kolonları beklenen formatta değil.")
+        df = _filter_by_station(df, station)
+        out = df[
+            ["ChatGPT Kanonik İsim", "İstasyon", "Mobil Uygulama", "Diğer Mobil Uygulamalar", "Grup/Şirket Bilgisi"]
+        ].to_dict(orient="records")
+        return _ok(out)
+    except Exception as e:
+        return _err(str(e))
 
-    results = df[df["İstasyon"].str.contains(station, case=False, na=False)]
-
-    data = []
-    for _, row in results.iterrows():
-        data.append({
-            "ChatGPT Kanonik İsim": row["ChatGPT Kanonik İsim"],
-            "İstasyon": row["İstasyon"],
-            "Kampanya 1": row["Kampanya 1"],
-            "Kampanya 2": row["Kampanya 2"]
-        })
-    return {"status": "ok", "data": data}
+@app.get("/campaigns", tags=["campaigns"])
+def get_campaigns(
+    station: Optional[str] = Query(None, description="İstasyon adı (örn. ZES, Shell Recharge, Trugo)")
+):
+    try:
+        df = _read("Sayfa3")
+        needed = {"ChatGPT Kanonik İsim", "İstasyon", "KAMPANYA 1", "KAMPANYA 2"}
+        if not needed.issubset(df.columns):
+            return _err("Sayfa3 kolonları beklenen formatta değil.")
+        df = _filter_by_station(df, station)
+        out = df[["ChatGPT Kanonik İsim", "İstasyon", "KAMPANYA 1", "KAMPANYA 2"]].to_dict(orient="records")
+        return _ok(out)
+    except Exception as e:
+        return _err(str(e))
